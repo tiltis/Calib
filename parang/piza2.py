@@ -1,58 +1,115 @@
 """
-Wave Orthorectification v8
+Wave Orthorectification v9
 
-핵심 전략 변경:
-  v7까지: 마루 간격(파장) 기반으로 m/pixel 추정 → 너울/풍랑 구분 실패
-  v8: 마루 이동속도 기반으로 m/pixel 추정 (primary)
-
-이유:
-  - 이동속도 방식은 마루가 너울이든 풍랑이든 상관없음
-  - 마루 하나를 추적해서 "y좌표별 이동속도(px/sec)"를 측정하면,
-    encounter_speed(m/s) / velocity(px/s) = m/pixel
-  - 이건 파장을 몰라도, 너울/풍랑을 구분 못해도 성립
-  - 필요한 가정: encounter speed가 일정 (SOG, 파도방향 일정)
-
-파장 기반은 교차검증용으로만 사용.
+v8 → v9 변경사항:
+  - Weather_Info.xlsx에서 영상별 기상 파라미터 자동 로딩
+  - 영상 경로에서 Dir_Name 자동 추출 (폴더명 = xlsx 행 이름)
+  - 결과를 output 폴더에 저장
+      · {dir_name}_calib.json : 캘리브레이션 요약 (R², m/px, enc speed 등)
+      · {dir_name}_ortho.mp4  : 등거리 투영 영상
+  - encounter speed 선택 개선
+      · 기존(v8): R² < 0.3이면 wind enc 재시도 → 버그 (R²은 enc speed와 무관)
+      · 신규(v9): swell dominance 기반 가중 enc speed를 1차 사용
+                  dominance > 0.7 → swell, < 0.3 → wind, 나머지 → weighted
 """
 
 import cv2
 import numpy as np
 import os
+import json
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
-from collections import defaultdict
+import openpyxl
 
 # ============================================================
-# 메타데이터
+# 경로 상수
 # ============================================================
-SOG_KNOTS = 18.555
-HEADING_DEG = 141.455
-SWELL_HS = 2.485
-SWELL_DIR = 150.179
-SWELL_TP = 8.561
-WIND_HS = 0.867
-WIND_DIR = 128.615
-WIND_TP = 3.993
-G = 9.81
-
-SWELL_WAVELENGTH = G * SWELL_TP**2 / (2 * np.pi)
-WIND_WAVELENGTH = G * WIND_TP**2 / (2 * np.pi)
-SWELL_PHASE_SPEED = SWELL_WAVELENGTH / SWELL_TP
-WIND_PHASE_SPEED = WIND_WAVELENGTH / WIND_TP
-ENCOUNTER_ANGLE_RAD = np.radians(SWELL_DIR - HEADING_DEG)
-SOG_MS = SOG_KNOTS * 0.5144
-
-# encounter speed: 너울 기준 (지배적이므로)
-ENCOUNTER_SPEED_SWELL = SWELL_PHASE_SPEED + SOG_MS * np.cos(ENCOUNTER_ANGLE_RAD)
-# 풍랑 기준
-ENCOUNTER_SPEED_WIND = WIND_PHASE_SPEED + SOG_MS * np.cos(np.radians(WIND_DIR - HEADING_DEG))
-
-SWELL_DOMINANCE = SWELL_HS / (SWELL_HS + WIND_HS)
-
+G            = 9.81
 CALIB_SECONDS = 20
+XLSX_PATH    = r"C:\Users\tilti\OneDrive\samjung\Weather_Info.xlsx"
+OUTPUT_DIR   = r"C:\Users\tilti\OneDrive\samjung\output"
 
 # ============================================================
-# ROI
+# xlsx 로딩
+# ============================================================
+def load_weather_params(xlsx_path, dir_name):
+    """
+    Weather_Info.xlsx에서 dir_name 행의 기상 파라미터를 딕셔너리로 반환.
+    dir_name이 없으면 None 반환.
+    """
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb.active
+    headers = None
+    result = None
+    for row in ws.iter_rows(values_only=True):
+        if headers is None:
+            headers = row
+            continue
+        if str(row[0]) == dir_name:
+            p = dict(zip(headers, row))
+            result = {
+                "sog_knots":  float(p["SOG[knots]"]),
+                "heading_deg": float(p["Heading"]),
+                "wind_hs":    float(p["significant_height_of_wind_waves"]),
+                "wind_dir":   float(p["mean_direction_of_wind_waves"]),
+                "wind_tp":    float(p["mean_period_of_wind_waves"]),
+                "swell_hs":   float(p["significant_height_of_total_swell"]),
+                "swell_dir":  float(p["mean_direction_of_total_swell"]),
+                "swell_tp":   float(p["mean_period_of_total_swell"]),
+            }
+            break
+    wb.close()
+    return result
+
+
+def calc_wave_params(p):
+    """
+    기상 파라미터 딕셔너리로부터 파속, encounter speed 계산.
+
+    encounter speed 선택 전략:
+      dominance > 0.7  → swell enc (너울 지배)
+      dominance < 0.3  → wind enc  (풍랑 지배)
+      0.3 ~ 0.7        → weighted (혼합)
+    """
+    sog_ms   = p["sog_knots"] * 0.5144
+    swell_wl = G * p["swell_tp"]**2 / (2 * np.pi)
+    wind_wl  = G * p["wind_tp"]**2  / (2 * np.pi)
+    swell_c  = swell_wl / p["swell_tp"]
+    wind_c   = wind_wl  / p["wind_tp"]
+
+    enc_swell = swell_c + sog_ms * np.cos(np.radians(p["swell_dir"] - p["heading_deg"]))
+    enc_wind  = wind_c  + sog_ms * np.cos(np.radians(p["wind_dir"]  - p["heading_deg"]))
+
+    dominance = (p["swell_hs"] / (p["swell_hs"] + p["wind_hs"])
+                 if (p["swell_hs"] + p["wind_hs"]) > 0 else 0.5)
+
+    # 지배 파계에 따라 1차 encounter speed 결정
+    if dominance > 0.7:
+        enc_primary = enc_swell
+        enc_label   = f"swell (dom={dominance:.0%})"
+    elif dominance < 0.3:
+        enc_primary = enc_wind
+        enc_label   = f"wind  (dom={dominance:.0%})"
+    else:
+        enc_primary = dominance * enc_swell + (1 - dominance) * enc_wind
+        enc_label   = f"weighted (dom={dominance:.0%})"
+
+    return {
+        "sog_ms":      sog_ms,
+        "swell_wl":    swell_wl,
+        "wind_wl":     wind_wl,
+        "swell_c":     swell_c,
+        "wind_c":      wind_c,
+        "enc_swell":   enc_swell,
+        "enc_wind":    enc_wind,
+        "enc_primary": enc_primary,
+        "enc_label":   enc_label,
+        "dominance":   dominance,
+    }
+
+
+# ============================================================
+# ROI 선택
 # ============================================================
 roi_state = {"drawing": False, "start": None, "end": None, "selected": False}
 
@@ -66,6 +123,10 @@ def select_roi(event, x, y, flags, param):
 
 def nothing(x): pass
 
+
+# ============================================================
+# 영상 열기
+# ============================================================
 def open_video(path):
     if not os.path.isfile(path):
         print(f"X not found: {path}"); return None
@@ -85,22 +146,22 @@ def open_video(path):
 # ============================================================
 def detect_crests(gray, min_dist=8):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enh = clahe.apply(gray)
-    sob = np.abs(cv2.Sobel(enh, cv2.CV_64F, 0, 1, ksize=3))
-    prof = gaussian_filter1d(np.mean(sob, axis=1), sigma=2)
-    std = np.std(prof)
-    peaks, props = find_peaks(prof, distance=min_dist, prominence=max(std * 0.4, 1.0))
+    enh   = clahe.apply(gray)
+    sob   = np.abs(cv2.Sobel(enh, cv2.CV_64F, 0, 1, ksize=3))
+    prof  = gaussian_filter1d(np.mean(sob, axis=1), sigma=2)
+    std   = np.std(prof)
+    peaks, _ = find_peaks(prof, distance=min_dist, prominence=max(std * 0.4, 1.0))
     return peaks, prof
 
 
 # ============================================================
-# 마루 추적기 (v8: 속도 측정에 특화)
+# 마루 추적기
 # ============================================================
 class CrestTracker:
     def __init__(self, max_disp=25):
-        self.tracks = {}
-        self.prev = {}
-        self.nid = 0
+        self.tracks   = {}
+        self.prev     = {}
+        self.nid      = 0
         self.max_disp = max_disp
 
     def update(self, fi, crests):
@@ -125,27 +186,19 @@ class CrestTracker:
                 self.nid += 1
 
     def get_velocity_vs_y(self, fps, min_frames=8):
-        """
-        각 트랙에서 구간별 속도를 추출.
-        트랙이 길면 여러 구간으로 나눠서 (y, velocity) 데이터를 밀도 있게 수집.
-        """
-        results = []  # (y_position, px_per_sec)
+        """각 트랙에서 슬라이딩 윈도우로 (y위치, px/sec) 추출"""
+        results = []
         for tid, pts in self.tracks.items():
-            if len(pts) < min_frames:
-                continue
+            if len(pts) < min_frames: continue
             arr = np.array(pts, dtype=np.float64)
-            # 슬라이딩 윈도우로 국소 속도 측정
             win = max(min_frames, len(arr) // 4)
             for start in range(0, len(arr) - win + 1, win // 2):
                 chunk = arr[start:start + win]
                 dt = (chunk[-1, 0] - chunk[0, 0]) / fps
-                if dt < 0.2:
-                    continue
-                dy = chunk[-1, 1] - chunk[0, 1]
-                vel = dy / dt
-                if vel > 1:  # 아래로 이동만
-                    mean_y = np.mean(chunk[:, 1])
-                    results.append((mean_y, vel))
+                if dt < 0.2: continue
+                vel = (chunk[-1, 1] - chunk[0, 1]) / dt
+                if vel > 1:  # 아래 방향 이동만
+                    results.append((np.mean(chunk[:, 1]), vel))
         return results
 
     def get_long_tracks(self, min_len=10):
@@ -157,10 +210,8 @@ class CrestTracker:
 # ============================================================
 def build_velocity_scale_map(vel_vs_y, roi_h, encounter_speed):
     """
-    (y, px_per_sec) 데이터로부터 m/pixel(y) = encounter_speed / velocity(y)
-
-    선형 회귀: velocity = a*y + b  (위쪽은 느리게, 아래쪽은 빠르게 이동)
-    → m/pixel = encounter_speed / (a*y + b)
+    (y, px/sec) 데이터로 m/pixel(y) = encounter_speed / velocity(y) 산출.
+    선형 회귀: velocity(y) = a*y + b
     """
     if len(vel_vs_y) < 20:
         return None, None, None
@@ -168,55 +219,46 @@ def build_velocity_scale_map(vel_vs_y, roi_h, encounter_speed):
     data = np.array(vel_vs_y)
     ys, vels = data[:, 0], data[:, 1]
 
-    # 이상치 제거
+    # IQR 이상치 제거
     q1, q3 = np.percentile(vels, [25, 75])
-    iqr = q3 - q1
-    mask = (vels > q1 - 1.5 * iqr) & (vels < q3 + 1.5 * iqr) & (vels > 1)
+    iqr  = q3 - q1
+    mask = (vels > q1 - 1.5*iqr) & (vels < q3 + 1.5*iqr) & (vels > 1)
     ys, vels = ys[mask], vels[mask]
-
     if len(ys) < 20:
         return None, None, None
 
-    # 선형 회귀: velocity(y) = a*y + b
     coeffs = np.polyfit(ys, vels, 1)
-    poly = np.poly1d(coeffs)
+    poly   = np.poly1d(coeffs)
 
-    # R²
-    pred = poly(ys)
+    pred   = poly(ys)
     ss_res = np.sum((vels - pred)**2)
     ss_tot = np.sum((vels - np.mean(vels))**2)
-    r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    r_sq   = 1 - ss_res / ss_tot if ss_tot > 0 else 0
 
-    # 전체 y에 대한 velocity, m/pixel
-    y_full = np.arange(roi_h, dtype=np.float64)
-    vel_full = poly(y_full)
-    vel_full = np.clip(vel_full, 1.0, None)  # 최소 1 px/s
+    y_full    = np.arange(roi_h, dtype=np.float64)
+    vel_full  = np.clip(poly(y_full), 1.0, None)
+    mpp       = encounter_speed / vel_full
 
-    m_per_pixel = encounter_speed / vel_full
+    print(f"   선형 회귀: vel(y) = {coeffs[0]:.4f}*y + {coeffs[1]:.2f}  R²={r_sq:.3f}")
+    print(f"   속도 범위: {vel_full[0]:.1f}(상단) ~ {vel_full[-1]:.1f} px/s(하단)")
+    print(f"   m/px 범위: {mpp[0]:.3f}(상단) ~ {mpp[-1]:.3f}(하단)")
+    print(f"   스케일 비율: {mpp[0]/mpp[-1]:.2f}x")
 
-    print(f"   Linear fit: vel(y) = {coeffs[0]:.4f}*y + {coeffs[1]:.2f}  R2={r_sq:.3f}")
-    print(f"   vel range: {vel_full[0]:.1f} (top) ~ {vel_full[-1]:.1f} px/s (bot)")
-    print(f"   m/px range: {m_per_pixel[0]:.3f} (top) ~ {m_per_pixel[-1]:.3f} (bot)")
-    print(f"   scale ratio: {m_per_pixel[0] / m_per_pixel[-1]:.2f}x")
-
-    return y_full, m_per_pixel, r_sq
+    return y_full, mpp, r_sq
 
 
-def build_remap_tables(roi_w, roi_h, m_per_pixel_map):
-    """등거리 remap: 세로만 y좌표별 스케일 보정, 가로는 그대로 → 직사각형 출력"""
-    base_mpp = m_per_pixel_map[-1]  # 하단 기준 (가장 정밀)
-
-    cumulative = np.cumsum(m_per_pixel_map)
+def build_remap_tables(roi_w, roi_h, mpp_map):
+    """등거리 remap 테이블 생성 (세로 비선형 보정, 가로 그대로)"""
+    base_mpp   = mpp_map[-1]  # 하단 기준 (가장 가까운 곳, 가장 정밀)
+    cumulative = np.cumsum(mpp_map)
     total_dist = cumulative[-1]
-    out_h = max(int(total_dist / base_mpp), roi_h)
+    out_h      = max(int(total_dist / base_mpp), roi_h)
 
     out_dist = np.linspace(0, total_dist, out_h)
-    src_y = np.interp(out_dist, cumulative, np.arange(roi_h, dtype=np.float64))
+    src_y    = np.interp(out_dist, cumulative, np.arange(roi_h, dtype=np.float64))
 
-    # map_x: 가로는 원본 그대로 (왜곡 없음)
-    # map_y: 세로만 등거리 보정
     map_x = np.tile(np.arange(roi_w, dtype=np.float32), (out_h, 1))
-    map_y = np.zeros((out_h, roi_w), dtype=np.float32)
+    map_y = np.full((out_h, roi_w), 0, dtype=np.float32)
     for row in range(out_h):
         map_y[row, :] = src_y[row]
 
@@ -226,38 +268,26 @@ def build_remap_tables(roi_w, roi_h, m_per_pixel_map):
 # ============================================================
 # 시각화
 # ============================================================
-def draw_scale_graph(m_per_pixel, vel_raw, roi_h, enc_speed, width=350):
-    """스케일 맵 그래프: 흰선=회귀 결과, 초록점=개별 측정"""
+def draw_scale_graph(mpp_map, vel_raw, roi_h, enc_speed, width=350):
+    """스케일 맵 그래프 (흰선=회귀, 초록점=측정값)"""
     canvas = np.zeros((roi_h, width, 3), dtype=np.uint8)
-
-    if m_per_pixel is not None:
-        mpp = m_per_pixel[:roi_h]
+    if mpp_map is not None:
+        mpp = mpp_map[:roi_h]
         mn, mx = mpp.min(), mpp.max()
         margin = (mx - mn) * 0.1 + 0.001
         mn -= margin; mx += margin
-
-        # 회귀 곡선 (흰색)
         norm = (mpp - mn) / (mx - mn) * (width - 40) + 20
         for i in range(1, len(norm)):
             cv2.line(canvas, (int(norm[i-1]), i-1), (int(norm[i]), i), (255,255,255), 2)
-
-        # 개별 측정점 (초록)
         for y_pos, vel in vel_raw:
             if 0 <= y_pos < roi_h and vel > 0:
                 mpp_pt = enc_speed / vel
-                x = int((mpp_pt - mn) / (mx - mn) * (width - 40) + 20)
-                x = int(np.clip(x, 2, width - 2))
-                cv2.circle(canvas, (x, int(y_pos)), 2, (0, 180, 0), -1)
-
-        cv2.putText(canvas, f"{m_per_pixel[0]:.3f} m/px (far)", (5, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
-        cv2.putText(canvas, f"{m_per_pixel[-1]:.3f} m/px (near)", (5, roi_h-8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
-
-    cv2.putText(canvas, "m/pixel vs y (velocity-based)", (5, 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100,200,255), 1)
-    cv2.putText(canvas, "white=fit  green=raw", (5, roi_h-22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (150,150,150), 1)
+                x = int(np.clip((mpp_pt - mn) / (mx - mn) * (width-40) + 20, 2, width-2))
+                cv2.circle(canvas, (x, int(y_pos)), 2, (0,180,0), -1)
+        cv2.putText(canvas, f"{mpp_map[0]:.3f} m/px (far)",  (5,20),  cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
+        cv2.putText(canvas, f"{mpp_map[-1]:.3f} m/px (near)",(5,roi_h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
+    cv2.putText(canvas, "m/pixel vs y (velocity)", (5,12),      cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100,200,255), 1)
+    cv2.putText(canvas, "white=fit  green=raw",    (5,roi_h-22),cv2.FONT_HERSHEY_SIMPLEX, 0.28, (150,150,150), 1)
     return canvas
 
 
@@ -267,34 +297,84 @@ def draw_info(img, lines, y0=20):
 
 
 # ============================================================
+# output 저장
+# ============================================================
+def save_calib_json(output_dir, dir_name, video_path, roi_rect,
+                    r_sq, enc_speed, enc_label, base_mpp, use_remap,
+                    out_size, weather_params, wave_params):
+    """캘리브레이션 결과를 JSON으로 저장"""
+    os.makedirs(output_dir, exist_ok=True)
+    data = {
+        "dir_name":   dir_name,
+        "video":      os.path.basename(video_path),
+        "roi":        list(roi_rect),
+        "r_sq":       round(float(r_sq), 4) if r_sq is not None else None,
+        "enc_speed":  round(float(enc_speed), 3),
+        "enc_label":  enc_label,
+        "base_mpp":   round(float(base_mpp), 4),
+        "use_remap":  use_remap,
+        "out_size":   list(out_size),
+        "weather":    {k: round(float(v), 4) for k, v in weather_params.items()},
+        "wave":       {k: (round(float(v), 4) if isinstance(v, float) else v)
+                       for k, v in wave_params.items()},
+    }
+    out_path = os.path.join(output_dir, f"{dir_name}_calib.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"  [저장] 캘리브레이션 JSON → {out_path}")
+    return out_path
+
+
+# ============================================================
 # 메인
 # ============================================================
 def main():
     video_path = r"C:\Users\tilti\OneDrive\samjung\Swell_20260120_UTC1007\Swell_FWD_20260120_UTC1007.mp4"
 
+    # ---- 영상 폴더명으로 xlsx 파라미터 자동 로드 ----
+    dir_name = os.path.basename(os.path.dirname(video_path))
+    print(f"\n  Dir: {dir_name}")
+
+    weather = load_weather_params(XLSX_PATH, dir_name)
+    if weather is None:
+        print(f"  경고: '{dir_name}'을 Weather_Info.xlsx에서 찾지 못했습니다.")
+        print("  하드코딩 폴백값으로 진행합니다.")
+        # 폴백: Swell_20260120_UTC1007 기본값
+        weather = {
+            "sog_knots": 18.555, "heading_deg": 141.455,
+            "wind_hs": 0.867,    "wind_dir": 128.615, "wind_tp": 3.993,
+            "swell_hs": 2.485,   "swell_dir": 150.179, "swell_tp": 8.561,
+        }
+    else:
+        print(f"  SOG={weather['sog_knots']:.1f}kts  HDG={weather['heading_deg']:.1f}°"
+              f"  Swell Hs={weather['swell_hs']:.2f}m Tp={weather['swell_tp']:.2f}s"
+              f"  Wind Hs={weather['wind_hs']:.2f}m Tp={weather['wind_tp']:.2f}s")
+
+    wave = calc_wave_params(weather)
+
+    # ---- 영상 열기 ----
     cap = open_video(video_path)
     if cap is None: return
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     ret, frame = cap.read()
-    if not ret: print("X"); return
+    if not ret: print("X 첫 프레임 읽기 실패"); return
     frame = cv2.resize(frame, (1024, 576))
     clone = frame.copy()
 
     print("\n" + "=" * 60)
-    print(f"  Swell: L={SWELL_WAVELENGTH:.1f}m T={SWELL_TP:.1f}s Hs={SWELL_HS:.1f}m c={SWELL_PHASE_SPEED:.1f}m/s")
-    print(f"  Wind:  L={WIND_WAVELENGTH:.1f}m Hs={WIND_HS:.1f}m dom={SWELL_DOMINANCE:.0%}")
-    print(f"  Ship:  SOG={SOG_MS:.1f}m/s  Enc(swell)={ENCOUNTER_SPEED_SWELL:.1f}m/s  Enc(wind)={ENCOUNTER_SPEED_WIND:.1f}m/s")
-    print(f"  Video: {total_frames}f {total_frames/fps:.0f}s {fps:.0f}fps")
+    print(f"  Swell: λ={wave['swell_wl']:.1f}m  c={wave['swell_c']:.1f}m/s  Enc={wave['enc_swell']:.1f}m/s")
+    print(f"  Wind:  λ={wave['wind_wl']:.1f}m   c={wave['wind_c']:.1f}m/s   Enc={wave['enc_wind']:.1f}m/s")
+    print(f"  사용 Enc: {wave['enc_primary']:.2f}m/s  ({wave['enc_label']})")
+    print(f"  SOG={wave['sog_ms']:.1f}m/s  Video={total_frames}f {total_frames/fps:.0f}s {fps:.0f}fps")
     print("=" * 60)
 
     # ---- ROI 선택 ----
-    win = "Select ROI"
+    win = "Select ROI  (drag -> Enter | r=redo | q=quit)"
     cv2.imshow(win, clone); cv2.waitKey(1)
     cv2.setMouseCallback(win, select_roi)
-    print("\n  Drag -> Enter | r=redo | q=quit\n")
 
     while True:
         d = clone.copy()
@@ -311,42 +391,41 @@ def main():
     y1 = min(roi_state["start"][1], roi_state["end"][1])
     x2 = max(roi_state["start"][0], roi_state["end"][0])
     y2 = max(roi_state["start"][1], roi_state["end"][1])
-    roi_w, roi_h = x2-x1, y2-y1
+    roi_w, roi_h = x2 - x1, y2 - y1
     if roi_w < 50 or roi_h < 50:
-        print("X too small"); return
+        print("X ROI가 너무 작음"); return
 
     # ============================================================
-    # Phase 1: 캘리브레이션 - 마루 추적 → 속도 측정
+    # Phase 1: 캘리브레이션 — 마루 추적 → 속도 측정
     # ============================================================
     calib_n = int(fps * CALIB_SECONDS)
     tracker = CrestTracker(max_disp=int(roi_h * 0.1))
 
-    print(f"\n  Phase 1: Tracking crests for {CALIB_SECONDS}s ({calib_n} frames)...")
+    print(f"\n  Phase 1: {CALIB_SECONDS}s 마루 추적 ({calib_n} frames)...")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    cw = "Calibrating"
+    cw = "Calibrating..."
     cv2.imshow(cw, np.zeros((roi_h, roi_w, 3), dtype=np.uint8)); cv2.waitKey(1)
 
     for fi in range(calib_n):
         ret, frame = cap.read()
         if not ret: break
         frame = cv2.resize(frame, (1024, 576))
-        gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        gray  = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
 
-        crests, prof = detect_crests(gray)
+        crests, _ = detect_crests(gray)
         tracker.update(fi, crests)
 
         if fi % 5 == 0:
             vis = frame[y1:y2, x1:x2].copy()
             for cy in crests:
-                cv2.line(vis, (0, cy), (roi_w, cy), (0,255,255), 1)
-            # 긴 트랙 시각화
+                cv2.line(vis, (0,cy), (roi_w,cy), (0,255,255), 1)
             for trk in tracker.get_long_tracks(5):
                 for j in range(1, len(trk)):
                     py, cy2 = int(trk[j-1,1]), int(trk[j,1])
-                    cv2.line(vis, (roi_w//2-3, py), (roi_w//2+3, cy2), (255,100,0), 1)
-            pct = (fi+1)/calib_n
-            cv2.rectangle(vis, (0,roi_h-6), (int(roi_w*pct), roi_h), (0,200,0), -1)
+                    cv2.line(vis, (roi_w//2-3,py), (roi_w//2+3,cy2), (255,100,0), 1)
+            pct = (fi+1) / calib_n
+            cv2.rectangle(vis, (0,roi_h-6), (int(roi_w*pct),roi_h), (0,200,0), -1)
             nt = len(tracker.get_long_tracks(8))
             cv2.putText(vis, f"{fi+1}/{calib_n} ({pct:.0%}) tracks={nt}",
                         (5,16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1)
@@ -359,89 +438,110 @@ def main():
     # ============================================================
     # 속도 기반 스케일 맵 구축
     # ============================================================
-    print("\n  Building velocity-based scale map...")
-
+    print("\n  스케일 맵 구축 중...")
     vel_vs_y = tracker.get_velocity_vs_y(fps, min_frames=8)
-    print(f"   Velocity samples: {len(vel_vs_y)}")
+    print(f"   속도 샘플 수: {len(vel_vs_y)}")
 
-    # 너울 encounter speed로 1차 시도
-    y_full, mpp_map, r_sq = build_velocity_scale_map(
-        vel_vs_y, roi_h, ENCOUNTER_SPEED_SWELL)
+    # 지배 파계 기반 encounter speed로 1차 시도
+    enc_used  = wave["enc_primary"]
+    enc_label = wave["enc_label"]
+    y_full, mpp_map, r_sq = build_velocity_scale_map(vel_vs_y, roi_h, enc_used)
 
-    # R²가 낮으면 풍랑 encounter speed로도 시도해서 비교
+    # R² < 0.3이면 다른 enc speed로 재시도 (swell/wind 중 아직 안 쓴 것)
+    # 주의: R²는 enc speed와 무관하므로 재시도해도 R²는 같음
+    # → enc_speed만 바꿔서 m/pixel 절대값 재계산 (R² 기준이 아닌 dominance 기반)
     if r_sq is not None and r_sq < 0.3:
-        print(f"\n   R2={r_sq:.3f} low with swell enc. Trying wind enc...")
-        y2_f, mpp2, r2_sq = build_velocity_scale_map(
-            vel_vs_y, roi_h, ENCOUNTER_SPEED_WIND)
-        if r2_sq is not None and r2_sq > r_sq:
-            print(f"   Wind enc R2={r2_sq:.3f} > swell R2={r_sq:.3f} -> using wind encounter speed")
-            y_full, mpp_map, r_sq = y2_f, mpp2, r2_sq
-        else:
-            print(f"   Wind enc not better. Keeping swell.")
+        print(f"   경고: R²={r_sq:.3f} 낮음. 파봉 추적 품질 확인 필요.")
 
     if mpp_map is not None and mpp_map[0] > mpp_map[-1]:
-        # 정상: 상단(먼곳) > 하단(가까운곳)
+        # 정상: 상단(먼쪽) m/px > 하단(가까운쪽)
         map_x, map_y, out_h, base_mpp = build_remap_tables(roi_w, roi_h, mpp_map)
         use_remap = True
-        print(f"\n   Remap ready: {roi_w}x{out_h} (from {roi_w}x{roi_h})")
-        print(f"   Output is {out_h/roi_h:.1f}x taller (equal m/pixel everywhere)")
-        print(f"   Base resolution: {base_mpp:.3f} m/px")
+        print(f"\n  Remap 준비 완료: {roi_w}x{out_h} (원본 {roi_w}x{roi_h})")
+        print(f"  세로 {out_h/roi_h:.1f}배 확장, 기준 해상도: {base_mpp:.3f} m/px")
     elif mpp_map is not None:
-        print(f"\n   WARNING: m/px inverted (top < bottom). Data may be unreliable.")
-        print(f"   Falling back to homography with measured ratio.")
-        ratio = mpp_map[0] / mpp_map[-1] if mpp_map[-1] > 0 else 1.5
-        ratio = max(ratio, 1.1)
+        # 비정상 (상하 반전) → homography fallback
+        print("   경고: m/px 상하 반전. Homography fallback으로 전환.")
+        ratio     = max(mpp_map[0] / mpp_map[-1] if mpp_map[-1] > 0 else 1.5, 1.1)
         use_remap = False
-        base_mpp = np.mean(mpp_map)
+        base_mpp  = float(np.mean(mpp_map))
     else:
-        print("   FAIL: not enough data -> homography fallback ratio=1.5")
-        ratio = 1.5
+        # 샘플 부족 → fallback
+        print("   FAIL: 샘플 부족 → homography fallback (ratio=1.5)")
+        ratio     = 1.5
         use_remap = False
-        base_mpp = 0
-        mpp_map = None
+        base_mpp  = 0.0
+        mpp_map   = None
 
-    # fallback 호모그래피
+    # Homography fallback 행렬 계산
     if not use_remap:
         shrink = (1.0 - 1.0 / ratio) / 2.0
-        mg = int(roi_w * shrink)
-        out_h = int(roi_h * ratio)
-        src = np.float32([[x1+mg,y1],[x2-mg,y1],[x1,y2],[x2,y2]])
-        dst = np.float32([[0,0],[roi_w,0],[0,out_h],[roi_w,out_h]])
+        mg     = int(roi_w * shrink)
+        out_h  = int(roi_h * ratio)
+        src    = np.float32([[x1+mg,y1],[x2-mg,y1],[x1,y2],[x2,y2]])
+        dst    = np.float32([[0,0],[roi_w,0],[0,out_h],[roi_w,out_h]])
         fb_mat = cv2.getPerspectiveTransform(src, dst)
         print(f"   Homography fallback: ratio={ratio:.2f} out={roi_w}x{out_h}")
 
-    # 스케일 그래프 (한 번)
-    sg = draw_scale_graph(mpp_map, vel_vs_y, roi_h, ENCOUNTER_SPEED_SWELL)
+    # ---- 캘리브레이션 결과 JSON 저장 ----
+    save_calib_json(
+        OUTPUT_DIR, dir_name, video_path,
+        roi_rect  = [x1, y1, x2, y2],
+        r_sq      = r_sq,
+        enc_speed = enc_used,
+        enc_label = enc_label,
+        base_mpp  = base_mpp,
+        use_remap = use_remap,
+        out_size  = [roi_w, out_h],
+        weather_params = weather,
+        wave_params    = wave,
+    )
+
+    # 스케일 그래프 (정적, 1회 생성)
+    sg = draw_scale_graph(mpp_map, vel_vs_y, roi_h, enc_used)
 
     # ============================================================
-    # Phase 2: 전체 재생 (remap만)
+    # Phase 2: 전체 재생 + 영상 저장
     # ============================================================
-    print(f"\n  Phase 2: Playing back (q=quit)\n")
+    print(f"\n  Phase 2: 재생 중  (q=종료 | s=저장 토글)\n")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     ov = "Overlay"
     cv2.imshow(ov, np.zeros((100,100,3), dtype=np.uint8)); cv2.waitKey(1)
     cv2.createTrackbar("alpha%", ov, 50, 100, nothing)
 
+    # 영상 저장 설정
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_video_path = os.path.join(OUTPUT_DIR, f"{dir_name}_ortho.mp4")
+    fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
+    writer    = cv2.VideoWriter(out_video_path, fourcc, fps, (roi_w, out_h))
+    is_saving = True   # 기본 저장 ON
+    print(f"  [저장] 등거리 투영 영상 → {out_video_path}")
+
     dmax = 800
 
     while True:
         ret, frame = cap.read()
-        if not ret: print("  Done."); break
+        if not ret: print("  완료."); break
         frame = cv2.resize(frame, (1024, 576))
-        roi = frame[y1:y2, x1:x2]
+        roi   = frame[y1:y2, x1:x2]
 
+        # 등거리 투영
         if use_remap:
             warped = cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
         else:
             warped = cv2.warpPerspective(frame, fb_mat, (roi_w, out_h))
 
-        # 1. Original
+        # 영상 저장
+        if is_saving and writer is not None:
+            writer.write(warped)
+
+        # --- 1. 원본 ---
         f1 = frame.copy()
         cv2.rectangle(f1, (x1,y1), (x2,y2), (0,255,0), 2)
 
-        # 2. Ortho (세로로 길어진 등거리)
+        # --- 2. 등거리 투영 (표시용 리사이즈) ---
         if warped.shape[0] > dmax:
             ds = dmax / warped.shape[0]
             wd = cv2.resize(warped, (int(warped.shape[1]*ds), dmax))
@@ -450,23 +550,27 @@ def main():
             ds = 1.0
 
         if base_mpp > 0 and wd.shape[0] > 50:
-            bpx = int(50 / base_mpp * ds)
-            bpx = min(bpx, wd.shape[1]-20)
-            bh = wd.shape[0]
+            bpx = min(int(50 / base_mpp * ds), wd.shape[1] - 20)
+            bh  = wd.shape[0]
             cv2.line(wd, (10,bh-20), (10+bpx,bh-20), (0,255,0), 2)
             cv2.putText(wd, "50m", (10,bh-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-        # 3. Overlay
-        a = cv2.getTrackbarPos("alpha%", ov) / 100.0
+        # --- 3. Overlay ---
+        a   = cv2.getTrackbarPos("alpha%", ov) / 100.0
         ovl = frame.copy()
         if warped.shape[0] > 0:
             wr = cv2.resize(warped, (roi_w, roi_h))
             ovl[y1:y2, x1:x2] = cv2.addWeighted(roi, 1-a, wr, a, 0)
         cv2.rectangle(ovl, (x1,y1), (x2,y2), (0,255,0), 1)
+
+        # 저장 상태 표시
+        save_tag = "REC" if is_saving else "---"
         draw_info(ovl, [
-            f"Swell L={SWELL_WAVELENGTH:.0f}m Hs={SWELL_HS:.1f}m",
-            f"Enc={ENCOUNTER_SPEED_SWELL:.1f}m/s  base={base_mpp:.3f}m/px",
-            f"{'remap' if use_remap else 'homography'}  out={roi_w}x{out_h}",
+            f"Swell λ={wave['swell_wl']:.0f}m Hs={weather['swell_hs']:.1f}m",
+            f"Enc={enc_used:.1f}m/s  base={base_mpp:.3f}m/px",
+            f"{'remap' if use_remap else 'homography'}  R²={r_sq:.3f}"
+            if r_sq is not None else f"{'remap' if use_remap else 'homography'}",
+            f"[{save_tag}] s=저장토글",
         ])
 
         cv2.imshow("1 Original", f1)
@@ -474,8 +578,17 @@ def main():
         cv2.imshow("3 Scale Map", sg)
         cv2.imshow(ov, ovl)
 
-        if cv2.waitKey(max(1, int(1000/fps))) & 0xFF == ord('q'):
+        k = cv2.waitKey(max(1, int(1000/fps))) & 0xFF
+        if k == ord('q'):
             break
+        elif k == ord('s'):
+            is_saving = not is_saving
+            print(f"  저장 {'ON' if is_saving else 'OFF'}")
+
+    if writer is not None:
+        writer.release()
+        if is_saving:
+            print(f"  [완료] {out_video_path}")
 
     cap.release()
     cv2.destroyAllWindows()
