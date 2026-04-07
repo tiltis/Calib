@@ -23,9 +23,9 @@ import importlib.util
 # ============================================================
 # 경로
 # ============================================================
-VIDEO_BASE = r"C:\Users\tilti\OneDrive\samjung"
+VIDEO_BASE = r"C:\Users\tilti\OneDrive\samjung\data"
 OUTPUT_DIR = r"C:\Users\tilti\OneDrive\samjung\output"
-PIZA2_PATH = os.path.join(os.path.dirname(__file__), "..", "piza2.py")
+PIZA2_PATH = os.path.join(os.path.dirname(__file__), "piza5.py")
 
 # ============================================================
 # piza2 모듈 동적 로드
@@ -327,6 +327,12 @@ def main():
     for i, (name, files) in enumerate(folders):
         print(f"  [{i}] {name}  ({len(files)}개 mp4)")
 
+    def parse_num(raw, max_val, default=0):
+        """'1번', '2', '3.' 등에서 숫자만 추출. 범위 초과 시 default."""
+        digits = ''.join(c for c in raw if c.isdigit())
+        n = int(digits) if digits else default
+        return n if 0 <= n <= max_val else default
+
     # 처리할 폴더 선택
     if args.dir:
         targets = [(n, f) for n, f in folders if n == args.dir]
@@ -335,41 +341,56 @@ def main():
     elif args.all:
         targets = folders
     else:
-        idx = input("\n처리할 폴더 번호 (엔터=0번): ").strip()
-        idx = int(idx) if idx.isdigit() else 0
+        raw = input("\n처리할 폴더 번호: ").strip()
+        idx = parse_num(raw, len(folders) - 1, default=0)
         targets = [folders[idx]]
 
     piza2_mod = load_piza2()
 
     for dir_name, mp4_files in targets:
         print(f"\n\n{'='*60}")
-        print(f"  폴더: {dir_name}  ({len(mp4_files)}개 영상)")
+        print(f"  폴더: {dir_name}")
         print(f"{'='*60}")
+
+        # 파일 목록 출력 + 선택
+        print("  영상 파일:")
+        for j, f in enumerate(mp4_files):
+            print(f"    [{j}] {f}")
+
+        if len(mp4_files) == 1:
+            # 파일이 1개면 자동 선택
+            file_indices = [0]
+            print("  → 자동 선택: [0]")
+        else:
+            raw_f = input(
+                "  처리할 파일 번호 (엔터=전체 / 숫자=단일 / 2,3=복수): "
+            ).strip()
+            if raw_f == "":
+                file_indices = list(range(len(mp4_files)))
+            else:
+                # 콤마/공백 구분으로 복수 선택 지원
+                parts = raw_f.replace(",", " ").split()
+                file_indices = []
+                for p in parts:
+                    n = parse_num(p, len(mp4_files) - 1, default=0)
+                    if n not in file_indices:
+                        file_indices.append(n)
 
         # 저장된 ROI 확인
         saved_roi = load_roi(dir_name)
         if saved_roi:
             print(f"  저장된 ROI 있음: {saved_roi}")
 
-        used_roi = None
-        for i, fname in enumerate(mp4_files):
+        for order, fi in enumerate(file_indices):
+            fname      = mp4_files[fi]
             video_path = os.path.join(VIDEO_BASE, dir_name, fname)
-            print(f"\n  [{i+1}/{len(mp4_files)}] {fname}")
+            print(f"\n  [{order+1}/{len(file_indices)}] {fname}")
 
-            # 첫 영상 또는 저장된 ROI 없으면 대화형 선택
-            roi_to_use = saved_roi if i > 0 and saved_roi else saved_roi
-            result = process_one(video_path, piza2_mod, saved_roi=roi_to_use)
+            result = process_one(video_path, piza2_mod, saved_roi=saved_roi)
 
             if result is not None and saved_roi is None:
-                # 첫 번째 영상에서 얻은 ROI 저장
                 save_roi(dir_name, result)
                 saved_roi = result
-
-            # 다음 영상 계속 여부
-            if i < len(mp4_files) - 1:
-                cont = input(f"\n  다음 영상 계속? ({mp4_files[i+1]}) [Y/n]: ").strip().lower()
-                if cont == 'n':
-                    break
 
     print("\n\n배치 처리 완료.")
 
